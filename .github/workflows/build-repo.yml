@@ -1,0 +1,82 @@
+name: Build & publish repo
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build extensions and publish Mihon repo
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Prepare signing key (optional but recommended)
+        run: |
+          if [ -n "${{ secrets.SIGNING_KEY }}" ]; then
+            echo "${{ secrets.SIGNING_KEY }}" | base64 -d > signingkey.jks
+            echo "Using committed signing key."
+          else
+            echo "::warning::No SIGNING_KEY secret set. Falling back to a debug key — APKs will install, but the signature changes every run, so Mihon cannot update them in place (you'd have to uninstall/reinstall). Run the 'Generate signing key' workflow to fix this."
+          fi
+
+      - name: Build extensions
+        env:
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew src:all:nhentai:assembleRelease src:all:ehentai:assembleRelease src:all:pururin:assembleRelease src:all:hitomi:assembleRelease src:en:hentai2read:assembleRelease -x spotlessCheck
+
+      - name: Collect built APKs
+        run: |
+          mkdir -p ~/apk-artifacts
+          find . -path '*/build/outputs/apk/release/*.apk' -exec cp -v {} ~/apk-artifacts/ \;
+
+      - name: Generate repo index (index.min.json + icons)
+        run: |
+          python ./.github/scripts/move-built-apks.py
+          INSPECTOR_LINK="$(curl -s "https://api.github.com/repos/keiyoushi/extensions-inspector/releases/latest" | jq -r '.assets[0].browser_download_url')"
+          curl -L "$INSPECTOR_LINK" -o ./Inspector.jar
+          java -jar ./Inspector.jar "repo/apk" "output.json" "tmp"
+          python ./.github/scripts/create-repo.py
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -f signingkey.jks
+
+      - name: Publish to 'repo' branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          publish_branch: repo
+          force_orphan: true
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'Update extension repo'
